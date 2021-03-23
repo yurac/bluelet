@@ -393,18 +393,9 @@ class SocketClosedError(Exception):
     pass
 
 class Listener(object):
-    """A socket wrapper object for listening sockets.
-    """
-    def __init__(self, host, port):
-        """Create a listening socket on the given hostname and port.
-        """
+    def __init__(self, sock):
         self._closed = False
-        self.host = host
-        self.port = port
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.bind((host, port))
-        self.sock.listen(5)
+        self.sock = sock
 
     def accept(self):
         """An event that waits for a connection on the listening socket.
