@@ -58,6 +58,18 @@ class WaitableEvent(Event):
         """
         pass
 
+class ReadableEvent(WaitableEvent):
+    def __init__(self, fd):
+        self.fd = fd
+    def waitables(self):
+        return (self.fd,), (), ()
+
+class WritableEvent(WaitableEvent):
+    def __init__(self, fd):
+        self.fd = fd
+    def waitables(self):
+        return (), (self.fd,), ()
+
 class ValueEvent(Event):
     """An event that does nothing but return a fixed value"""
     def __init__(self, value):
@@ -70,8 +82,9 @@ class ExceptionEvent(Event):
 
 class SpawnEvent(Event):
     """Add a new coroutine thread to the scheduler"""
-    def __init__(self, coro):
+    def __init__(self, coro, daemon):
         self.spawned = coro
+        self.daemon = daemon
 
 class JoinEvent(Event):
     """Suspend the thread until the specified child thread has
@@ -133,7 +146,6 @@ class WriteEvent(WaitableEvent):
     def fire(self):
         self.fd.write(self.data)
 
-
 # Core scheduler logic
 def event_select(events):
     """Perform a select() over all the Events provided, returning the
@@ -151,7 +163,7 @@ def event_select(events):
                 earliest_wakeup = event.wakeup_time
             else:
                 earliest_wakeup = min(earliest_wakeup, event.wakeup_time)
-        elif isinstance(event, WaitableEvent):
+        if isinstance(event, WaitableEvent):
             r, w, x = event.waitables()
             rlist += r
             wlist += w
@@ -230,16 +242,38 @@ def run(root_coro):
     # Maps child coroutines to joining (exit-waiting) parents
     joiners = collections.defaultdict(list)
 
+    # Auto join
+    spawned = collections.defaultdict(list)
+
+    # Auto cleanup
+    cleanup = collections.defaultdict(collections.deque)
+
+    # Ancestors
+    ancestors = {root_coro: root_coro}
+
     # History of spawned coroutines for joining of already completed
     # coroutines
     history = weakref.WeakKeyDictionary({root_coro: None})
 
-    def complete_thread(coro, return_value):
+    def complete_thread(coro, return_value, is_killed=False):
         """Remove a coroutine from the scheduling pool, awaking
         delegators and joiners as necessary and returning the specified
         value to any delegating parent
         """
+
+        # If we are terminated abruptly, auto release locks
+        if is_killed:
+            for cb in cleanup[coro]:
+                cb()
+
         del threads[coro]
+        del ancestors[coro]
+
+        # Recursive auto join
+        for task in spawned[coro]:
+            if task in threads:
+                kill_thread(task)
+        del spawned[coro]
 
         # Resume delegator
         if coro in delegators:
@@ -290,7 +324,50 @@ def run(root_coro):
 
         # Complete each coroutine from the top to the bottom of the stack
         for coro in reversed(coros):
-            complete_thread(coro, None)
+            complete_thread(coro, None, True)
+            coro.close()
+
+    # FIXME: Maybe move this to class Lock. In this case we need to define an EventLoop structure
+    def lock_set_owner(coro, lock):
+        coro = ancestors[coro]
+        lock._owner = coro
+        cleanup[coro].appendleft(lambda: lock_auto_release(coro, lock))
+
+    def lock_acquire(coro, lock):
+        if not lock._locked:
+            lock._locked = True
+            lock_set_owner(coro, lock)
+            # Continue running immediately
+            threads[coro] = ValueEvent(None)
+            return
+
+        assert ancestors[coro] != lock._owner, "Attempt to acquire lock twice"
+
+        lock._waiters.append(coro)
+        threads[coro] = SUSPENDED
+
+    def lock_release(coro, lock):
+        assert ancestors[coro] == lock._owner, "Attempt to release lock from thread that does not own it"
+
+        # Pick up a new owner
+        while len(lock._waiters):
+            waiter = lock._waiters.popleft()
+
+            if waiter in threads:
+                # Set waiter as the new owner
+                lock_set_owner(waiter, lock)
+                threads[waiter] = ValueEvent(None)
+                threads[coro] = ValueEvent(None)
+                return
+
+        # If no one is interested, release lock
+        lock._locked = False
+        lock._owner = None
+        threads[coro] = ValueEvent(None)
+
+    def lock_auto_release(coro, lock):
+        if coro == lock._owner:
+            lock_release(coro, lock)
 
     # Continue advancing threads until root thread exits
     exit_te = None
@@ -301,10 +378,16 @@ def run(root_coro):
             while True:
                 have_ready = False
                 for coro, event in list(threads.items()):
+                    # Note that recursive kill could remove multiple threads
+                    if coro not in threads:
+                        continue
                     if isinstance(event, SpawnEvent):
                         threads[event.spawned] = ValueEvent(None)
+                        ancestors[event.spawned] = event.spawned
                         history[event.spawned] = None
-                        advance_thread(coro, None)
+                        if not event.daemon:
+                            spawned[coro].append(event.spawned)
+                        advance_thread(coro, event.spawned)
                         have_ready = True
                     elif isinstance(event, ValueEvent):
                         advance_thread(coro, event.value)
@@ -315,6 +398,7 @@ def run(root_coro):
                     elif isinstance(event, DelegationEvent):
                         threads[coro] = Delegated(event.spawned)
                         threads[event.spawned] = ValueEvent(None)
+                        ancestors[event.spawned] = ancestors[coro]
                         history[event.spawned] = None
                         delegators[event.spawned] = coro
                         have_ready = True
@@ -331,8 +415,63 @@ def run(root_coro):
                         have_ready = True
                     elif isinstance(event, KillEvent):
                         threads[coro] = ValueEvent(None)
-                        kill_thread(event.child)
+                        if event.child in threads:
+                            assert ancestors[event.child] == event.child, "Can only kill a spawned thread"
+                            kill_thread(event.child)
                         have_ready = True
+                    elif isinstance(event, LockEvent):
+                        have_ready = True
+                        if event.is_acquire:
+                            lock_acquire(coro, event.lock)
+                        else:
+                            lock_release(coro, event.lock)
+                    elif isinstance(event, SemaphoreEvent):
+                        have_ready = True
+                        sem = event.sem
+                        assert sem.locked()
+                        if event.is_acquire:
+                            sem._waiters.append(coro)
+                            threads[coro] = SUSPENDED
+                        else:
+                            while sem._waiters:
+                                w = sem._waiters.popleft()
+                                if w in threads:
+                                    threads[w] = ValueEvent(None)
+                                    break
+                            else:
+                                sem._value += 1
+                            threads[coro] = ValueEvent(None)
+                    elif isinstance(event, ConditionEvent):
+                        have_ready = True
+                        cond = event.cond
+                        if event.is_notify:
+                            n = event.n_notify
+                            if n == 0:
+                                n = len(cond._waiters)
+                            while cond._waiters and n:
+                                w = cond._waiters.popleft()
+                                if w in threads:
+                                    n -= 1
+                                    lock_acquire(w, cond._lock)
+                            threads[coro] = ValueEvent(None)
+                        else:
+                            lock_release(coro, cond._lock)
+                            cond._waiters.append(coro)
+                            threads[coro] = SUSPENDED
+
+                    elif isinstance(event, SignalEvent):
+                        have_ready = True
+                        signal = event.signal
+                        if event.is_set:
+                            signal.value = True
+                            while signal._waiters:
+                                w = signal._waiters.popleft()
+                                if w in threads:
+                                    threads[w] = ValueEvent(None)
+                            threads[coro] = ValueEvent(None)
+                        else:
+                            signal._waiters.append(coro)
+                            threads[coro] = SUSPENDED
 
                 # Only start the select when nothing else is ready
                 if not have_ready:
@@ -433,7 +572,7 @@ class Connection(object):
             self.buf = self.buf[size:]
             return ValueEvent(out)
         else:
-            return ReceiveEvent(self, size)
+            return ReceiveEvent(self.sock, size)
 
     def send(self, data):
         """Sends data on the socket, returning the number of bytes
@@ -441,13 +580,13 @@ class Connection(object):
         """
         if self.closed:
             raise SocketClosedError()
-        return SendEvent(self, data)
+        return SendEvent(self.sock, data)
 
     def sendall(self, data):
         """Send all of data on the socket"""
         if self.closed:
             raise SocketClosedError()
-        return SendEvent(self, data, True)
+        return SendEvent(self.sock, data, True)
 
     def readline(self, terminator=b"\n", bufsize=1024):
         """Reads a line (delimited by terminator) from the socket"""
@@ -460,7 +599,7 @@ class Connection(object):
                 line += terminator
                 yield ReturnEvent(line)
                 break
-            data = yield ReceiveEvent(self, bufsize)
+            data = yield ReceiveEvent(self.sock, bufsize)
             if data:
                 self.buf += data
             else:
@@ -487,33 +626,183 @@ class ReceiveEvent(WaitableEvent):
     """An event for Connection objects (connected sockets) for
     asynchronously reading data
     """
-    def __init__(self, conn, bufsize):
-        self.conn = conn
+    def __init__(self, sock, bufsize):
+        self.sock = sock
         self.bufsize = bufsize
 
     def waitables(self):
-        return (self.conn.sock,), (), ()
+        return (self.sock,), (), ()
 
     def fire(self):
-        return self.conn.sock.recv(self.bufsize)
+        return self.sock.recv(self.bufsize)
 
 class SendEvent(WaitableEvent):
     """An event for Connection objects (connected sockets) for
     asynchronously writing data
     """
-    def __init__(self, conn, data, sendall=False):
-        self.conn = conn
+    def __init__(self, sock, data, sendall=False):
+        self.sock = sock
         self.data = data
         self.sendall = sendall
 
     def waitables(self):
-        return (), (self.conn.sock,), ()
+        return (), (self.sock,), ()
 
     def fire(self):
         if self.sendall:
-            return self.conn.sock.sendall(self.data)
+            return self.sock.sendall(self.data)
         else:
-            return self.conn.sock.send(self.data)
+            return self.sock.send(self.data)
+
+# Locking primitives
+class Lock(object):
+    def __init__(self):
+        self._waiters = collections.deque()
+        self._locked = False
+        self._owner = None
+
+    def locked(self):
+        return self._locked
+
+    def acquire(self):
+        yield LockEvent(self, True)
+
+    def release(self):
+        assert self._locked and self._owner, "Attempt to release a free lock"
+        yield LockEvent(self, False)
+
+class LockEvent(object):
+    def __init__(self, lock, is_acquire):
+        self.lock = lock
+        self.is_acquire = is_acquire
+
+class Condition(object):
+    def __init__(self, lock=None):
+        if lock is None:
+            lock = Lock()
+        self._lock = lock
+
+        self.locked = lock.locked
+        self.acquire = lock.acquire
+        self.release = lock.release
+
+        self._waiters = collections.deque()
+
+    def wait(self):
+        assert self.locked()
+        yield ConditionEvent(self, is_notify=False)
+
+    def wait_for(self, predicate):
+        result = predicate()
+        while not result:
+            yield self.wait()
+            result = predicate()
+
+    def notify(self, n=1):
+        assert self.locked()
+        yield ConditionEvent(self, is_notify=True, n_notify=n)
+
+    def notify_all(self):
+        assert self.locked()
+        yield ConditionEvent(self, is_notify=True, n_notify=0)
+
+class ConditionEvent(object):
+    def __init__(self, cond, is_notify, n_notify=0):
+        self.cond = cond
+        self.is_notify = is_notify
+        self.n_notify = n_notify
+
+class Semaphore(object):
+    def __init__(self, value=1, bound=1):
+        self._waiters = collections.deque()
+        self._value = value
+        self._bound = bound
+
+    def locked(self):
+        return self._value == 0
+
+    def acquire(self):
+        if self._value > 0:
+            self._value -= 1
+            return
+        yield SemaphoreEvent(self, True)
+
+    def release(self):
+        if not self._waiters:
+            assert self._value < self._bound
+            self._value += 1
+            return
+        yield SemaphoreEvent(self, False)
+
+class SemaphoreEvent(object):
+    def __init__(self, sem, is_acquire):
+        self.sem = sem
+        self.is_acquire = is_acquire
+
+# Corresponds to the event primitive
+class Signal(object):
+    def __init__(self):
+        self._waiters = collections.deque()
+        self.value = False
+
+    def is_set(self):
+        return self._value
+
+    def set(self):
+        yield SignalEvent(self, True)
+
+    def clear(self):
+        self.value = False
+
+    def wait(self):
+        if self.value:
+            return
+        yield SignalEvent(self, False)
+
+class SignalEvent(object):
+    def __init__(self, signal, is_set):
+        self.signal = signal
+        self.is_set = is_set
+
+# Wait for a system call with an optional timeout and an otional interrupt signal
+def wait_for(coro, timeout=None, interrupt=None):
+    if timeout is None and interrupt is None:
+        res = yield coro
+        yield end((True, res))
+
+    sig = Signal()
+    cond = [(False, None)]
+
+    def wait_task(sig, cond):
+        try:
+            res = yield coro
+            cond[0] = (True, res)
+            yield sig.set()
+        finally:
+            pass
+
+    yield spawn(wait_task(sig, cond), daemon=False)
+
+    if timeout is not None:
+        def timeout_task(sig):
+            try:
+                yield sleep(timeout)
+                yield sig.set()
+            finally:
+                pass
+        yield spawn(timeout_task(sig), daemon=False)
+
+    if interrupt is not None:
+        def interrupt_task(sig):
+            try:
+                yield interrupt.wait()
+                yield sig.set()
+            finally:
+                pass
+        yield spawn(interrupt_task(sig), daemon=False)
+
+    yield sig.wait()
+    yield end(cond[0])
 
 # Public interface for threads; each returns an event object that
 # can immediately be yielded
@@ -522,13 +811,13 @@ def null():
     """
     return ValueEvent(None)
 
-def spawn(coro):
+def spawn(coro, daemon=True):
     """Event: add another coroutine to the scheduler. Both the parent
     and child coroutines run concurrently
     """
     if not isinstance(coro, types.GeneratorType):
         raise ValueError('%s is not a coroutine' % str(coro))
-    return SpawnEvent(coro)
+    return SpawnEvent(coro, daemon)
 
 def call(coro):
     """Event: delegate to another coroutine. The current coroutine
@@ -564,6 +853,12 @@ def read(fd, bufsize=None):
 def write(fd, data):
     """Event: write to a file descriptor asynchronously"""
     return WriteEvent(fd, data)
+
+def send(sock, data):
+    yield SendEvent(sock, data, False)
+
+def sendall(sock, data):
+    yield SendEvent(sock, data, True)
 
 def connect(host, port):
     """Event: connect to a network address and return a Connection
